@@ -1,0 +1,66 @@
+{
+  "env": "dev",
+  "objective": "minimize_time_integral",
+  "max_iterations": 100,
+  "sleep_after_start": 0.0,
+  "parameters": [
+    {
+      "name": "pzr_p",
+      "description": "indta.i card 20510100: 4th field (index 3) after 'przp_err sum' — gain on line 2071",
+      "line_key": "20520100",
+      "column_index": 3,
+      "initial_value": 10.0,
+      "min_value": 1.0,
+      "max_value": 500.0,
+      "step": 1.0
+    },
+    {
+      "name": "pzr_i",
+      "description": "None",
+      "line_key": "20520200",
+      "column_index": 3,
+      "initial_value": 0.08,
+      "min_value": 0.0,
+      "max_value": 10.0,
+      "step": 1.0
+    },
+    {
+      "name": "pzr_d",
+      "description": "None",
+      "line_key": "20520300",
+      "column_index": 3,
+      "initial_value": 0.08,
+      "min_value": 0.0,
+      "max_value": 10.0,
+      "step": 1.0
+    }
+  ],
+  "objectives": [
+    {
+      "name": "压力偏差积分",
+      "value_column_index": 16,
+      "reference_value": 15500000.0,
+      "deviation": "absolute",
+      "weight": 1.0,
+      "scale": 1.0
+    }
+  ],
+  "integral_objective": {
+    "stripf_relative_path": "stripf",
+    "csv_relative_path": "plot/stripf_plotrec_row.csv",
+    "time_column_index": 0,
+    "value_column_index": 16,
+    "reference_value": 15500000.0,
+    "deviation": "absolute"
+  },
+  "integral_optimizer": {
+    "convergence_tolerance": 0.5,
+    "max_function_evaluations": 25,
+    "max_relap_retries": 10,
+    "optimizer": "genetic",
+    "exploration_xi": 0.01,
+    "random_seed": 12345,
+    "ga_crossover_probability": 0.9,
+    "ga_mutation_scale": 0.12
+  }
+}

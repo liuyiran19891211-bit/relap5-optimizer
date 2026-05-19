@@ -1,0 +1,46 @@
+{
+  "env": "prod",
+  "objective": "minimize_time_integral",
+  "max_iterations": 20,
+  "sleep_after_start": 0.0,
+  "parameters": [
+    {
+      "name": "example_param_length",
+      "description": "Example production setting. Adjust to real parameter and range before running.",
+      "line_key": "1010301",
+      "column_index": 1,
+      "initial_value": 0.1,
+      "min_value": 0.05,
+      "max_value": 0.2,
+      "step": 0.005
+    }
+  ],
+  "objectives": [
+    {
+      "name": "example_integral_target",
+      "value_column_index": 2,
+      "reference_value": 0.95,
+      "deviation": "absolute",
+      "weight": 1.0,
+      "scale": 1.0
+    }
+  ],
+  "integral_objective": {
+    "stripf_relative_path": "stripf",
+    "csv_relative_path": "plot/stripf_plotrec_row.csv",
+    "time_column_index": 0,
+    "value_column_index": 2,
+    "reference_value": 0.95,
+    "deviation": "absolute"
+  },
+  "integral_optimizer": {
+    "convergence_tolerance": 0.5,
+    "max_function_evaluations": 25,
+    "max_relap_retries": 10,
+    "optimizer": "genetic",
+    "exploration_xi": 0.01,
+    "random_seed": 12345,
+    "ga_crossover_probability": 0.9,
+    "ga_mutation_scale": 0.12
+  }
+}

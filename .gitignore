@@ -1,0 +1,44 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.codex_deps/
+
+# RELAP executables and large binary/runtime artifacts
+Relap.exe
+tpfh2onew
+read_steam_comment.o
+indta
+outdta
+outdta.o
+rstplt
+rstplt.r
+screen
+plot/Relap.exe
+plot/indta
+plot/indta.backup
+plot/outdta
+plot/rstplt
+plot/rstplt.r
+plot/stripf
+plot/screen
+
+# Generated optimization outputs
+runs/
+optimization_run_*.log
+streamlit_*.log
+*.log
+
+# Generated plot CSVs
+plot/*_plotrec_row.csv
+plot/*_plotrec_rows.csv
+
+# Local editor/OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

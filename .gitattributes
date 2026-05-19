@@ -1,0 +1,9 @@
+* text=auto
+
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.i text eol=lf
+*.bib text eol=lf
+*.bat text eol=crlf
+
