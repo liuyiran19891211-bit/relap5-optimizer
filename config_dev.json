@@ -58,6 +58,8 @@
     "max_function_evaluations": 25,
     "max_relap_retries": 10,
     "optimizer": "genetic",
+    "parallel_workers": 5,
+    "parallel_run_root": "runs/parallel_relap",
     "exploration_xi": 0.01,
     "random_seed": 12345,
     "ga_crossover_probability": 0.9,

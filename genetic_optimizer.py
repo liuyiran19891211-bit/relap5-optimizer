@@ -1,8 +1,9 @@
 """Small dependency-free genetic optimizer for continuous multi-objective search.
 
 The public entry point, :func:`ga_minimize_pareto`, implements a compact
-NSGA-II style loop using only numpy.  It is intentionally serial because the
-RELAP workflow mutates shared files such as ``indta.i`` and ``stripf``.
+NSGA-II style loop using only numpy.  Callers may provide a batch evaluator
+when the expensive simulation backend can isolate each run in its own
+workspace.
 """
 
 from __future__ import annotations
@@ -228,6 +229,8 @@ def ga_minimize_pareto(
     crossover_probability: float = 0.9,
     mutation_scale: float = 0.12,
     stop_requested: Optional[Callable[[], bool]] = None,
+    evaluate_many: Optional[Callable[[Sequence[np.ndarray]], Sequence[Record]]] = None,
+    parallel_workers: int = 1,
 ) -> Dict[str, Any]:
     """Minimize multiple objectives over continuous bounds using a small NSGA-II loop."""
     bounds_arr = np.asarray(bounds, dtype=float)
@@ -256,6 +259,7 @@ def ga_minimize_pareto(
         pop_size = min(max_evaluations, max(8, 2 * d + 4))
     else:
         pop_size = min(max_evaluations, max(2, int(population_size)))
+    batch_size = max(1, int(parallel_workers))
 
     rng = np.random.default_rng(seed=int(random_seed))
     crossover_probability = min(1.0, max(0.0, float(crossover_probability)))
@@ -291,6 +295,33 @@ def ga_minimize_pareto(
         record = evaluate(x.copy())
         return add_record(record, x)
 
+    def eval_candidates(candidates: Sequence[np.ndarray]) -> List[Individual]:
+        if stop_requested is not None and stop_requested():
+            return []
+        clamped = [
+            np.maximum(a_vec, np.minimum(b_vec, np.asarray(x, dtype=float))).copy()
+            for x in candidates
+        ]
+        if not clamped:
+            return []
+
+        if evaluate_many is not None and len(clamped) > 1:
+            records = list(evaluate_many([x.copy() for x in clamped]))
+            if len(records) != len(clamped):
+                raise ValueError(
+                    "evaluate_many must return one record for each candidate "
+                    f"({len(records)} vs {len(clamped)})"
+                )
+            return [add_record(record, x) for record, x in zip(records, clamped)]
+
+        out: List[Individual] = []
+        for x in clamped:
+            ind = eval_candidate(x)
+            if ind is None:
+                break
+            out.append(ind)
+        return out
+
     if warm_start_records:
         for record in warm_start_records:
             if len(evaluations) >= max_evaluations:
@@ -317,15 +348,24 @@ def ga_minimize_pareto(
     while len(population) < pop_size and len(evaluations) < max_evaluations:
         if stop_requested is not None and stop_requested():
             break
-        if seed_i < len(seeds):
-            cand = seeds[seed_i]
-            seed_i += 1
-        else:
-            cand = a_vec + rng.random(d) * (b_vec - a_vec)
-        ind = eval_candidate(cand)
-        if ind is None:
+        pending: List[np.ndarray] = []
+        while (
+            len(population) + len(pending) < pop_size
+            and len(evaluations) + len(pending) < max_evaluations
+            and len(pending) < batch_size
+        ):
+            if seed_i < len(seeds):
+                cand = seeds[seed_i]
+                seed_i += 1
+            else:
+                cand = a_vec + rng.random(d) * (b_vec - a_vec)
+            pending.append(cand)
+        if not pending:
             break
-        population.append(ind)
+        inds = eval_candidates(pending)
+        if not inds:
+            break
+        population.extend(inds)
 
     if not population:
         return {
@@ -348,6 +388,7 @@ def ga_minimize_pareto(
         remaining = max_evaluations - len(evaluations)
         child_budget = min(pop_size, remaining)
 
+        child_candidates: List[np.ndarray] = []
         for _ in range(child_budget):
             p1 = _tournament(population, rng)
             p2 = _tournament(population, rng)
@@ -365,12 +406,14 @@ def ga_minimize_pareto(
                 child_x = child_x.copy()
                 child_x[mask] += rng.normal(0.0, sigma[mask])
             child_x = np.maximum(a_vec, np.minimum(b_vec, child_x))
+            child_candidates.append(child_x)
 
-            ind = eval_candidate(child_x)
-            if ind is None:
+        for start in range(0, len(child_candidates), batch_size):
+            inds = eval_candidates(child_candidates[start : start + batch_size])
+            if not inds:
                 stop_reason = "stopped_by_user"
                 break
-            children.append(ind)
+            children.extend(inds)
 
         population = _select_population(
             list(population) + children,
@@ -391,4 +434,3 @@ def ga_minimize_pareto(
         "best_record": dict(best_record) if best_record is not None else None,
         "population_size": pop_size,
     }
-

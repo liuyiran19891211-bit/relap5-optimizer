@@ -415,7 +415,7 @@ $env:PYTHONPATH="C:\Users\yiran\Desktop\relap参数优化开发\test\.codex_deps
 当前全量测试结果：
 
 ```text
-Ran 132 tests
+Ran 134 tests
 OK
 ```
 
@@ -515,3 +515,80 @@ $env:PYTHONPATH="C:\Users\yiran\Desktop\relap参数优化开发\test\.codex_deps
 6. 将 `max_function_evaluations` 设小，跑 smoke test。
 7. 通过后再扩大评估次数并启动正式优化。
 
+## 16. 并行 RELAP5 仿真
+
+### 16.1 设计原则
+
+RELAP5 本身仍然是单线程程序；本系统的提速方式是在优化器层面并行启动多份彼此隔离的 RELAP 工作目录。每个 worker 都有自己的 `indta.i`、`outdta`、`outdta.o`、`rstplt`、`rstplt.r`、`plot/stripf` 和 CSV 输出，因此多个仿真可以同时运行而不会互相覆盖文件。
+
+默认配置：
+
+```json
+"integral_optimizer": {
+  "optimizer": "genetic",
+  "parallel_workers": 5,
+  "parallel_run_root": "runs/parallel_relap"
+}
+```
+
+`parallel_workers` 当前只对 `optimizer="genetic"` 生效。`bayesian` 和 `golden_section` 都是强顺序搜索，下一点依赖上一点的结果，因此会自动退回串行评估。
+
+### 16.2 目录结构
+
+启动遗传优化时，`auto_optimize.prepare_relap_worker_workspaces()` 会创建：
+
+```text
+runs/parallel_relap/
+  worker_01/
+    start.bat
+    indta.i
+    Relap.exe
+    tpfh2onew
+    plot/
+      strip.bat
+      strip.i
+      Relap.exe
+      extract_plotrec_rows.py
+  worker_02/
+  ...
+  worker_05/
+```
+
+`runs/` 已被 `.gitignore` 排除，这些目录属于本地运行产物，不进入仓库。
+
+### 16.3 执行链路
+
+并行链路如下：
+
+1. `genetic_optimizer.ga_minimize_pareto()` 按批次生成候选参数。
+2. 当 `parallel_workers > 1` 时，遗传优化器调用 `evaluate_many()` 批量评估。
+3. `auto_optimize.evaluate_records_parallel()` 用 `ThreadPoolExecutor` 分配空闲 worker。
+4. 每个 worker 调用同一套 `evaluate_record()`：
+   - 写入该 worker 的 `indta.i`。
+   - 在该 worker 目录执行 `start.bat`。
+   - 检查该 worker 的 `outdta.o`。
+   - 用该 worker 的 `rstplt` 运行 `plot/strip.bat`。
+   - 从该 worker 的 CSV 计算目标函数。
+5. 评估结果统一写回主进程的 `history`，并按 `evaluation` 编号排序返回。
+
+### 16.4 注意事项
+
+- worker 数量不宜超过 CPU 核数、磁盘吞吐和 RELAP 许可证/运行限制能承受的范围。
+- 每个 worker 会复制 RELAP 可执行文件和后处理可执行文件，5 个 worker 会占用额外磁盘空间。
+- `last_safe_x` 仍然用于失败回退；并行时每个任务会读取启动时的安全点快照，成功后再更新共享安全点。
+- Dashboard 仍然走同一个 `auto_optimize.run_optimization()` 入口，因此 UI 和 CLI 不需要维护两套优化逻辑。
+
+### 16.5 快速自检
+
+只创建并检查 worker 目录：
+
+```powershell
+$py="C:\Users\yiran\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+& $py -c "import auto_optimize; auto_optimize.prepare_relap_worker_workspaces(5, root='runs/parallel_relap', emit=print)"
+```
+
+检查每个 worker 是否包含运行文件：
+
+```powershell
+Get-ChildItem runs\parallel_relap -Directory
+```

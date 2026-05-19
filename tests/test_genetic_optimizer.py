@@ -147,7 +147,41 @@ class TestGeneticOptimizer(unittest.TestCase):
         self.assertTrue(np.all(arr[:, 1] >= 3.0))
         self.assertTrue(np.all(arr[:, 1] <= 4.0))
 
+    def test_batch_evaluator_uses_parallel_budget(self) -> None:
+        batch_sizes = []
+        fallback_calls = {"n": 0}
+
+        def make_record(x: np.ndarray):
+            obj = float((x[0] - 1.0) ** 2)
+            return {
+                "parameter_values": x.tolist(),
+                "objective_values": [obj],
+                "objective_value": obj,
+                "relap_failed": False,
+            }
+
+        def evaluate(x: np.ndarray):
+            fallback_calls["n"] += 1
+            return make_record(x)
+
+        def evaluate_many(xs):
+            batch_sizes.append(len(xs))
+            return [make_record(np.asarray(x, dtype=float)) for x in xs]
+
+        res = ga_minimize_pareto(
+            evaluate,
+            [(0.0, 2.0)],
+            max_evaluations=9,
+            random_seed=13,
+            evaluate_many=evaluate_many,
+            parallel_workers=3,
+        )
+
+        self.assertEqual(len(res["evaluations"]), 9)
+        self.assertTrue(any(size > 1 for size in batch_sizes))
+        self.assertLessEqual(max(batch_sizes), 3)
+        self.assertLessEqual(fallback_calls["n"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
-

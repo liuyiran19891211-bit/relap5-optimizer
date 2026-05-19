@@ -2,11 +2,14 @@ import argparse
 import json
 import locale
 import os
+import queue
+import shutil
 import subprocess
 import sys
 import math
 import threading
 import time as time_std
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple, Callable, Optional, Sequence
 
 from bayesian_optimizer import bo_minimize, bo_minimize_nd
@@ -26,7 +29,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTDTA_O_REL = "outdta.o"
 
 
-def check_outdta_failed(emit: Callable[[str], None]) -> Dict[str, Any]:
+def check_outdta_failed(
+    emit: Callable[[str], None],
+    base_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     检查 ``outdta.o`` 末行是否带有 RELAP 失败签名。
 
@@ -34,7 +40,8 @@ def check_outdta_failed(emit: Callable[[str], None]) -> Dict[str, Any]:
     在 RELAP 末行 ``Transient terminated by ...`` 通常是计算结局的权威标记，
     见 :data:`outdta_check.OUTDTA_FAILURE_PATTERNS`。
     """
-    diag = outdta_failure_diagnosis(os.path.join(BASE_DIR, OUTDTA_O_REL))
+    run_dir = base_dir or BASE_DIR
+    diag = outdta_failure_diagnosis(os.path.join(run_dir, OUTDTA_O_REL))
     if not diag["exists"]:
         emit(f"  ! 未发现 {OUTDTA_O_REL}（无法判断 RELAP 是否成功）")
         return diag
@@ -169,6 +176,7 @@ def _try_relap_with_recovery(
     param_cfgs: Sequence[Dict[str, Any]],
     emit: Callable[[str], None],
     stop_requested: Optional[Callable[[], bool]] = None,
+    work_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any], List[np.ndarray]]:
     """
     在 ``x_request`` 处尝试一次 RELAP；失败时按 :func:`_compute_recovery_candidate`
@@ -189,6 +197,7 @@ def _try_relap_with_recovery(
     ``(candidate_used: ndarray[d], diag, attempted_values: List[ndarray[d]])``
     始终用向量形式返回；上层若是 1D 直接取 ``[0]`` 即可。
     """
+    run_dir = work_dir or BASE_DIR
     candidate = np.atleast_1d(np.asarray(x_request, dtype=float)).copy()
     if candidate.shape[0] != len(param_cfgs):
         raise ValueError(
@@ -219,10 +228,11 @@ def _try_relap_with_recovery(
             "start.bat",
             emit=emit,
             expect_file_after="outdta",
+            cwd=run_dir,
             phase_label="主工况 start.bat",
         )
 
-        diag = check_outdta_failed(emit)
+        diag = check_outdta_failed(emit, base_dir=run_dir)
         if not diag["failed"]:
             return candidate, diag, attempted
 
@@ -282,6 +292,78 @@ def load_indta(path: str) -> List[str]:
 def save_indta(path: str, lines: List[str]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+
+
+def _find_existing_file(base_dir: str, names: Sequence[str]) -> str:
+    for name in names:
+        path = os.path.join(base_dir, name)
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "Missing required RELAP runtime file in "
+        f"{base_dir}: one of {', '.join(names)}"
+    )
+
+
+def _copy_file_to_dir(src: str, dst_dir: str, dst_name: Optional[str] = None) -> None:
+    os.makedirs(dst_dir, exist_ok=True)
+    shutil.copy2(src, os.path.join(dst_dir, dst_name or os.path.basename(src)))
+
+
+def prepare_relap_worker_workspaces(
+    worker_count: int,
+    *,
+    root: str,
+    emit: Callable[[str], None],
+) -> List[str]:
+    """Create isolated RELAP run directories for parallel evaluations."""
+    worker_count = max(1, int(worker_count))
+    root_dir = root if os.path.isabs(root) else os.path.join(BASE_DIR, root)
+    root_dir = os.path.abspath(root_dir)
+    os.makedirs(root_dir, exist_ok=True)
+
+    relap_exe = _find_existing_file(BASE_DIR, ("Relap.exe", "relap.exe"))
+    start_bat = _find_existing_file(BASE_DIR, ("start.bat",))
+    indta_template = _find_existing_file(BASE_DIR, ("indta.i",))
+    optional_root_files = [
+        os.path.join(BASE_DIR, name)
+        for name in ("tpfh2onew",)
+        if os.path.isfile(os.path.join(BASE_DIR, name))
+    ]
+
+    plot_src = os.path.join(BASE_DIR, "plot")
+    plot_relap_exe = _find_existing_file(plot_src, ("Relap.exe", "relap.exe"))
+    plot_required = [
+        _find_existing_file(plot_src, ("strip.bat",)),
+        _find_existing_file(plot_src, ("strip.i",)),
+        plot_relap_exe,
+    ]
+    plot_optional = [
+        os.path.join(plot_src, name)
+        for name in ("extract_plotrec_rows.py",)
+        if os.path.isfile(os.path.join(plot_src, name))
+    ]
+
+    worker_dirs: List[str] = []
+    for idx in range(worker_count):
+        worker_dir = os.path.join(root_dir, f"worker_{idx + 1:02d}")
+        plot_dir = os.path.join(worker_dir, "plot")
+        os.makedirs(plot_dir, exist_ok=True)
+
+        _copy_file_to_dir(start_bat, worker_dir)
+        _copy_file_to_dir(indta_template, worker_dir)
+        _copy_file_to_dir(relap_exe, worker_dir)
+        for src in optional_root_files:
+            _copy_file_to_dir(src, worker_dir)
+        for src in plot_required + plot_optional:
+            _copy_file_to_dir(src, plot_dir)
+
+        worker_dirs.append(worker_dir)
+
+    emit(
+        f"Parallel RELAP workspaces ready: {len(worker_dirs)} under {root_dir}"
+    )
+    return worker_dirs
 
 
 def format_value(value: float) -> str:
@@ -435,6 +517,13 @@ def validate_integral_optimization_config(config: Dict[str, Any]) -> None:
     except (TypeError, ValueError):
         errors.append("integral_optimizer.max_relap_retries 必须是整数")
 
+    try:
+        parallel_workers = int(opt_cfg.get("parallel_workers", 1))
+        if parallel_workers <= 0:
+            errors.append("integral_optimizer.parallel_workers must be >= 1")
+    except (TypeError, ValueError):
+        errors.append("integral_optimizer.parallel_workers must be an integer")
+
     optimizer = str(opt_cfg.get("optimizer", "genetic")).lower()
     if optimizer not in ("golden_section", "bayesian", "genetic"):
         errors.append("integral_optimizer.optimizer 必须是 golden_section/bayesian/genetic")
@@ -564,9 +653,10 @@ def run_bat(
     phase_label: str = "",
     min_expected_bytes_after: int = 32,
     heartbeat_interval_sec: float = 7.0,
+    cwd: Optional[str] = None,
 ) -> float:
     """
-    Run a .bat under BASE_DIR.
+    Run a .bat under ``cwd`` (defaults to BASE_DIR).
 
     Notes (Windows RELAP workflows)
     -------------------------------
@@ -580,11 +670,12 @@ def run_bat(
 
     Returns wall‑clock seconds spent inside the subprocess.
     """
-    script_path = os.path.join(BASE_DIR, script_name)
+    run_dir = os.path.abspath(cwd or BASE_DIR)
+    script_path = os.path.join(run_dir, script_name)
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"{script_name} not found at {script_path}")
 
-    artifact = os.path.join(BASE_DIR, expect_file_after) if expect_file_after else ""
+    artifact = os.path.join(run_dir, expect_file_after) if expect_file_after else ""
     artifact_mtime_before = (
         os.path.getmtime(artifact) if artifact and os.path.isfile(artifact) else None
     )
@@ -621,7 +712,7 @@ def run_bat(
     try:
         completed = subprocess.run(
             ["cmd.exe", "/c", "call", script_path],
-            cwd=BASE_DIR,
+            cwd=run_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -921,6 +1012,10 @@ def run_optimization_minimize_time_integral(
         opt_cfg.get("ga_crossover_probability", 0.9)
     )
     ga_mutation_scale = float(opt_cfg.get("ga_mutation_scale", 0.12))
+    parallel_workers = max(1, int(opt_cfg.get("parallel_workers", 1)))
+    parallel_run_root = str(
+        opt_cfg.get("parallel_run_root", os.path.join("runs", "parallel_relap"))
+    )
 
     if n_params > 1 and optimizer_kind == "golden_section":
         # 多参数下黄金分割不可用；自动切换并提示
@@ -958,10 +1053,37 @@ def run_optimization_minimize_time_integral(
         f" max RELAP retries per eval = {max_relap_retries}"
     )
 
-    eval_counter = {"n": 0}
+    if optimizer_kind != "genetic" and parallel_workers > 1:
+        emit(
+            "parallel_workers is only used by optimizer='genetic'; "
+            f"current optimizer={optimizer_kind}, running sequentially."
+        )
+        parallel_workers = 1
 
-    def evaluate_record(x_request_arr: np.ndarray) -> Dict[str, Any]:
+    worker_dirs: List[str] = []
+    if optimizer_kind == "genetic" and parallel_workers > 1:
+        worker_dirs = prepare_relap_worker_workspaces(
+            parallel_workers,
+            root=parallel_run_root,
+            emit=emit,
+        )
+        emit(
+            f"Parallel RELAP execution enabled: up to {len(worker_dirs)} "
+            "simulations at the same time."
+        )
+
+    eval_counter = {"n": 0}
+    eval_lock = threading.Lock()
+    history_lock = threading.Lock()
+    last_safe_lock = threading.Lock()
+
+    def evaluate_record(
+        x_request_arr: np.ndarray,
+        work_dir: Optional[str] = None,
+        worker_label: str = "",
+    ) -> Dict[str, Any]:
         x_request_arr = np.atleast_1d(np.asarray(x_request_arr, dtype=float))
+        run_dir = os.path.abspath(work_dir or BASE_DIR)
         if stop_requested is not None and stop_requested():
             return {
                 "evaluation": eval_counter["n"] + 1,
@@ -976,23 +1098,35 @@ def run_optimization_minimize_time_integral(
                 "objective_value": float("inf"),
                 "objective_values": [float("inf")] * len(obj_cfgs),
             }
-        eval_counter["n"] += 1
-        n = eval_counter["n"]
-        emit(
+        with eval_lock:
+            eval_counter["n"] += 1
+            n = eval_counter["n"]
+        log_prefix = f"[{worker_label}] " if worker_label else ""
+
+        def eval_emit(message: str) -> None:
+            emit(f"{log_prefix}{message}" if log_prefix else message)
+
+        eval_emit(
             f"\n--- Evaluation {n}: requested parameters = "
             f"{_vec_or_scalar_to_str(x_request_arr)} ---"
         )
 
+        with last_safe_lock:
+            last_safe_snapshot = (
+                None if last_safe["x"] is None else last_safe["x"].copy()
+            )
+
         candidate, diag, attempted = _try_relap_with_recovery(
             x_request=x_request_arr,
-            last_safe_x=last_safe["x"],
+            last_safe_x=last_safe_snapshot,
             initial_value=initial_vec,
             bracket=list(zip(a_vec.tolist(), b_vec.tolist())),
             max_retries=max_relap_retries,
-            indta_path=indta_path,
+            indta_path=os.path.join(run_dir, "indta.i"),
             param_cfgs=param_cfgs,
-            emit=emit,
+            emit=eval_emit,
             stop_requested=stop_requested,
+            work_dir=run_dir,
         )
 
         # 1D 兼容字段：parameter_value（标量）取 candidate[0]，
@@ -1020,17 +1154,19 @@ def run_optimization_minimize_time_integral(
                 "objective_value": float("inf"),
                 "objective_values": [float("inf")] * len(obj_cfgs),
             }
-            history.append(rec)
+            with history_lock:
+                history.append(rec)
             if on_iteration is not None:
                 on_iteration(rec)
             return rec
 
-        last_safe["x"] = candidate.copy()
+        with last_safe_lock:
+            last_safe["x"] = candidate.copy()
 
         try:
-            emit("Running plot/strip.bat → extract（plot/strip.i 列更全）...")
+            eval_emit("Running plot/strip.bat → extract（plot/strip.i 列更全）...")
             meta = refresh_live_csv(
-                base_dir=BASE_DIR,
+                base_dir=run_dir,
                 output_csv_rel=csv_rel,
             )
             if not meta.get("success"):
@@ -1059,7 +1195,8 @@ def run_optimization_minimize_time_integral(
                 "objective_values": [float("inf")] * len(obj_cfgs),
                 "post_run_error": str(exc),
             }
-            history.append(rec)
+            with history_lock:
+                history.append(rec)
             if on_iteration is not None:
                 on_iteration(rec)
             return rec
@@ -1080,7 +1217,8 @@ def run_optimization_minimize_time_integral(
             "objective_value": float(agg),
             "objective_values": [float(p) for p in parts],
         }
-        history.append(rec)
+        with history_lock:
+            history.append(rec)
         if on_iteration is not None:
             on_iteration(rec)
         return rec
@@ -1091,6 +1229,47 @@ def run_optimization_minimize_time_integral(
             return float(rec.get("objective_value", float("inf")))
         except (TypeError, ValueError):
             return float("inf")
+
+    def evaluate_records_parallel(
+        candidates: Sequence[np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+        if parallel_workers <= 1 or not worker_dirs:
+            return [evaluate_record(np.asarray(x, dtype=float)) for x in candidates]
+
+        worker_pool: "queue.Queue[Tuple[int, str]]" = queue.Queue()
+        for idx, worker_dir in enumerate(worker_dirs, start=1):
+            worker_pool.put((idx, worker_dir))
+
+        results: List[Optional[Dict[str, Any]]] = [None] * len(candidates)
+
+        def _run_one(idx: int, x: np.ndarray) -> Tuple[int, Dict[str, Any]]:
+            worker_idx, worker_dir = worker_pool.get()
+            try:
+                rec = evaluate_record(
+                    np.asarray(x, dtype=float),
+                    work_dir=worker_dir,
+                    worker_label=f"worker-{worker_idx:02d}",
+                )
+                rec["worker"] = f"worker_{worker_idx:02d}"
+                rec["work_dir"] = worker_dir
+                return idx, rec
+            finally:
+                worker_pool.put((worker_idx, worker_dir))
+
+        with ThreadPoolExecutor(
+            max_workers=min(len(worker_dirs), len(candidates))
+        ) as executor:
+            future_map = {
+                executor.submit(_run_one, idx, np.asarray(x, dtype=float)): idx
+                for idx, x in enumerate(candidates)
+            }
+            for fut in as_completed(future_map):
+                idx, rec = fut.result()
+                results[idx] = rec
+
+        return [rec for rec in results if rec is not None]
 
     # === 第 1 次评估：用户配置的 initial_value 向量 ===
     emit(
@@ -1178,6 +1357,10 @@ def run_optimization_minimize_time_integral(
                 crossover_probability=ga_crossover_probability,
                 mutation_scale=ga_mutation_scale,
                 stop_requested=stop_requested,
+                evaluate_many=(
+                    evaluate_records_parallel if parallel_workers > 1 else None
+                ),
+                parallel_workers=parallel_workers,
             )
             pareto_front = list(ga_result.get("pareto_front", []))
             ga_best_rec = ga_result.get("best_record")
@@ -1243,7 +1426,7 @@ def run_optimization_minimize_time_integral(
     return {
         "success": math.isfinite(f_best),
         "stop_reason": stop_reason,
-        "history": history,
+        "history": sorted(history, key=lambda r: int(r.get("evaluation", 0))),
         # legacy 标量字段（仅参数维度=1 时有意义；多参数时取第一个分量做摘要）
         "final_parameter_value": float(x_best_vec[0]),
         # 完整向量字段（多参数推荐用这个）
