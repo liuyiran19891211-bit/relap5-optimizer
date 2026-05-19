@@ -1143,6 +1143,9 @@ def run_optimization_minimize_time_integral(
             "relap_last_line": diag.get("last_line"),
             "relap_matched_pattern": diag.get("matched_pattern"),
         }
+        if worker_label:
+            base_rec["worker"] = worker_label.replace("-", "_")
+            base_rec["work_dir"] = run_dir
 
         if diag["failed"]:
             emit(
@@ -1252,8 +1255,6 @@ def run_optimization_minimize_time_integral(
                     work_dir=worker_dir,
                     worker_label=f"worker-{worker_idx:02d}",
                 )
-                rec["worker"] = f"worker_{worker_idx:02d}"
-                rec["work_dir"] = worker_dir
                 return idx, rec
             finally:
                 worker_pool.put((worker_idx, worker_dir))
